@@ -146,6 +146,31 @@ describe('BacktestExecutor', () => {
       expect(result.finalBaseBalance.gt(new Big(0))).toBe(true);
     });
 
+    it('does not hide a fill callback failure behind skipped advice on the same candle', async () => {
+      let candlesSeen = 0;
+      const strategy = {
+        async onCandle(): Promise<OrderAdvice> {
+          candlesSeen++;
+          return {
+            amount: candlesSeen === 1 ? '1' : '0.00000001',
+            amountIn: 'base' as const,
+            side: OrderSide.BUY,
+            type: OrderType.MARKET,
+          };
+        },
+        async onFill(): Promise<void> {
+          throw new Error('fill callback failed');
+        },
+      };
+      const candles = [
+        createCandle({close: '100', open: '100', openTimeInISO: '2025-01-01T00:00:00.000Z'}),
+        createCandle({close: '100', open: '100', openTimeInISO: '2025-01-01T00:01:00.000Z'}),
+      ];
+
+      await expect(new BacktestExecutor({broker: createMockExchange(), candles, strategy, tradingPair}).execute())
+        .rejects.toThrow('fill callback failed');
+    });
+
     it('executes a sell with 1-candle delay when price rises above the sellAbove threshold', async () => {
       const strategy = new BuyBelowSellAboveStrategy({sellAbove: '100'});
 

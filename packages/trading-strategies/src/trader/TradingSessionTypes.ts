@@ -109,9 +109,9 @@ export interface TradingSessionBroker extends Pick<EventEmitter, 'on'> {
     options: Omit<LimitOrderOptions, 'type' | 'sizeInCounter'>
   ): Promise<PendingLimitOrder>;
   placeMarketOrder(pair: TradingPair, options: Omit<MarketOrderOptions, 'type'>): Promise<PendingMarketOrder>;
-  unwatchCandles(topicId: string): void;
+  unwatchCandles?(topicId: string): void;
   unwatchOrders(topicId: string): void;
-  watchCandles(pair: TradingPair, intervalInMillis: number, openTimeInISO: string): Promise<string>;
+  watchCandles?(pair: TradingPair, intervalInMillis: number, openTimeInISO: string): Promise<string>;
   watchOrders(): Promise<string>;
 }
 

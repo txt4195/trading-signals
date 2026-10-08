@@ -1,8 +1,8 @@
 import Big from 'big.js';
 import {CandleBatcher} from '@typedtrader/exchange';
-import type {Candle, FeeRate, TradingRules, TradingPair} from '@typedtrader/exchange';
-import {AdviceExecutor} from '../trader/AdviceExecutor.js';
-import type {OrderAdvice, TradingSessionState} from '../trader/TradingSessionTypes.js';
+import type {Candle} from '@typedtrader/exchange';
+import {TradingSession} from '../trader/TradingSession.js';
+import type {OrderAdvice} from '../trader/TradingSessionTypes.js';
 import type {BacktestConfig} from './BacktestConfig.js';
 import type {
   BacktestPerformanceSummary,
@@ -35,15 +35,6 @@ export class BacktestExecutor {
     const initialBaseBalance = initialBalances.base;
     const initialCounterBalance = initialBalances.counter;
 
-    // Fetch static values once before the loop
-    const [tradingRules, feeRates] = await Promise.all([
-      exchange.getTradingRules(tradingPair),
-      exchange.getFeeRates(tradingPair),
-    ]);
-
-    // The exact same advice→order translation a live TradingSession uses
-    const adviceExecutor = new AdviceExecutor({broker: exchange, feeRates, pair: tradingPair, tradingRules});
-
     /*
      * Same call TradingSession.start() makes before the first candle, with the broker as market.
      * A live session starts "now"; a backtest starts when its first candle opens.
@@ -51,7 +42,12 @@ export class BacktestExecutor {
     if (candles[0]) {
       exchange.setStartTime(candles[0].openTimeInISO);
     }
-    await strategy.init?.(exchange, tradingPair);
+    const session = new TradingSession({broker: exchange, pair: tradingPair, strategy});
+    await session.start({candleSource: 'external'});
+    const sessionErrors: Error[] = [];
+    session.on('error', error => {
+      sessionErrors.push(error);
+    });
 
     const trades: BacktestTrade[] = [];
     const skippedAdvices: BacktestSkippedAdvice[] = [];
@@ -60,57 +56,51 @@ export class BacktestExecutor {
     const initialPortfolioValue = initialBaseBalance.mul(firstOpenPrice).plus(initialCounterBalance);
     const equityCurve = [initialPortfolioValue];
 
-    for (const candle of candles) {
-      // Step 1: Match pending orders from previous iteration against this candle
-      const fills = exchange.processCandle(candle);
+    try {
+      for (const candle of candles) {
+        // Step 1: Match pending orders from previous iteration against this candle
+        const fills = exchange.processCandle(candle);
 
-      if (fills.length > 0) {
-        for (const fill of fills) {
-          trades.push({
-            advice: this.#findAdviceForFill(fill.order_id),
-            fee: new Big(fill.fee),
-            openTimeInISO: fill.created_at,
-            price: new Big(fill.price),
-            side: fill.side,
-            size: new Big(fill.size),
-          });
-          totalFees = totalFees.plus(fill.fee);
-
-          // Notify strategy of fill so it can update internal state
-          if (strategy.onFill) {
-            const fillState = await this.#buildState(tradingPair, tradingRules, feeRates);
-            await strategy.onFill(fill, fillState);
+        if (fills.length > 0) {
+          for (const fill of fills) {
+            trades.push({
+              advice: this.#findAdviceForFill(fill.order_id),
+              fee: new Big(fill.fee),
+              openTimeInISO: fill.created_at,
+              price: new Big(fill.price),
+              side: fill.side,
+              size: new Big(fill.size),
+            });
+            totalFees = totalFees.plus(fill.fee);
           }
         }
+
+        // TradingSession consumes the already-emitted fills, then evaluates this candle and
+        // executes advice through the same owner used by live trading.
+        const result = await session.next(CandleBatcher.createOneMinuteBatchedCandle([candle]));
+        const unreportedError = sessionErrors.find(error =>
+          !(result?.execution.status === 'SKIPPED' && result.execution.error === error)
+        );
+        sessionErrors.length = 0;
+        if (unreportedError) throw unreportedError;
+        equityCurve.push(await this.#calculatePortfolioValue(new Big(candle.close)));
+
+        if (!result) {
+          continue;
+        }
+
+        if (result.execution.status === 'PLACED') {
+          this.#orderAdviceMap.set(result.execution.order.id, result.advice);
+        } else {
+          skippedAdvices.push({
+            advice: result.advice,
+            openTimeInISO: candle.openTimeInISO,
+            reason: result.execution.error.message,
+          });
+        }
       }
-
-      // Step 2: Run strategy to get advice (strategies always receive 1-minute candles)
-      const batchedCandle = CandleBatcher.createOneMinuteBatchedCandle([candle]);
-      const state = await this.#buildState(tradingPair, tradingRules, feeRates);
-      const advice = await strategy.onCandle(batchedCandle, state);
-      equityCurve.push(await this.#calculatePortfolioValue(new Big(candle.close)));
-
-      if (!advice) {
-        continue;
-      }
-
-      // Step 3: Replace outstanding orders with the newest advice, mirroring TradingSession
-      const openOrders = await exchange.getOpenOrders(tradingPair);
-      if (openOrders.length > 0) {
-        await exchange.cancelOpenOrders(tradingPair);
-      }
-
-      const outcome = await adviceExecutor.execute(advice);
-
-      if (outcome.status === 'PLACED') {
-        this.#orderAdviceMap.set(outcome.order.id, advice);
-      } else {
-        skippedAdvices.push({
-          advice,
-          openTimeInISO: candle.openTimeInISO,
-          reason: outcome.error.message,
-        });
-      }
+    } finally {
+      await session.stop({cancelOpenOrders: true});
     }
 
     /*
@@ -118,8 +108,6 @@ export class BacktestExecutor {
      * This releases their held balances back to available so the final stats
      * correctly reflect what the portfolio actually holds.
      */
-    await exchange.cancelOpenOrders(tradingPair);
-
     const finalBalances = await exchange.getAvailableBalances(tradingPair);
     const lastClosePrice = candles.length > 0 ? new Big(candles[candles.length - 1].close) : new Big(0);
 
@@ -158,20 +146,6 @@ export class BacktestExecutor {
       throw new Error(`No advice recorded for filled order "${orderId}"`);
     }
     return advice;
-  }
-
-  async #buildState(pair: TradingPair, tradingRules: TradingRules, feeRates: FeeRate): Promise<TradingSessionState> {
-    const {broker: exchange} = this.#config;
-    const [balances, fills] = await Promise.all([exchange.getAvailableBalances(pair), exchange.getFills(pair)]);
-    const lastOrderSide = fills.length > 0 ? fills[0].side : undefined;
-
-    return {
-      baseBalance: balances.base,
-      counterBalance: balances.counter,
-      feeRates,
-      lastOrderSide,
-      tradingRules,
-    };
   }
 
   async #calculatePortfolioValue(price: Big): Promise<Big> {

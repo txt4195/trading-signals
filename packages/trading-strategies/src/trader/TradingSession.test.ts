@@ -90,7 +90,9 @@ describe('TradingSession', {concurrent: false}, () => {
   it('evaluates signal input through the same advice executor without replaying candles', async () => {
     const broker = createMockExchange();
     const owner = createMockStrategy();
-    const onSignal = vi.fn<NonNullable<TradingSessionStrategy['onSignal']>>().mockResolvedValue({type: 'MARKET', side: 'BUY', amountIn: 'base', amount: '1'});
+    const onSignal = vi
+      .fn<NonNullable<TradingSessionStrategy['onSignal']>>()
+      .mockResolvedValue({type: 'MARKET', side: 'BUY', amountIn: 'base', amount: '1'});
     const trading = new TradingSession({broker, pair, strategy: {...owner, onSignal}});
     const orders = vi.fn();
     const candles = vi.fn();
@@ -110,7 +112,9 @@ describe('TradingSession', {concurrent: false}, () => {
   it('reports signal evaluation errors without starting a separate order path', async () => {
     const broker = createMockExchange();
     const owner = createMockStrategy();
-    const onSignal = vi.fn<NonNullable<TradingSessionStrategy['onSignal']>>().mockRejectedValue(new Error('position_unavailable'));
+    const onSignal = vi
+      .fn<NonNullable<TradingSessionStrategy['onSignal']>>()
+      .mockRejectedValue(new Error('position_unavailable'));
     const trading = new TradingSession({broker, pair, strategy: {...owner, onSignal}});
     const errors = vi.fn();
     trading.on('error', errors);
@@ -212,7 +216,10 @@ describe('TradingSession', {concurrent: false}, () => {
   describe('candle handling', () => {
     it('processes an externally supplied candle once and awaits its advice without subscribing to candles', async () => {
       strategy.onCandle.mockResolvedValue({
-        type: 'MARKET', side: OrderSide.BUY, amountIn: 'counter', amount: AllAvailableAmount,
+        type: 'MARKET',
+        side: OrderSide.BUY,
+        amountIn: 'counter',
+        amount: AllAvailableAmount,
       });
       const orders = vi.fn();
       session.on('order', orders);
@@ -229,6 +236,37 @@ describe('TradingSession', {concurrent: false}, () => {
       await session.stop();
       expect(exchange.unwatchCandles).not.toHaveBeenCalled();
       expect(exchange.unwatchOrders).toHaveBeenCalledOnce();
+    });
+
+    it('finishes an already emitted fill before evaluating the next external candle', async () => {
+      strategy.onCandle.mockResolvedValue({type: 'MARKET', side: OrderSide.BUY, amountIn: 'base', amount: '1'});
+      let releaseFill!: () => void;
+      const fillStarted = new Promise<void>(resolve => {
+        releaseFill = resolve;
+      });
+      let fillStartedResolve!: () => void;
+      const fillStartedSignal = new Promise<void>(resolve => {
+        fillStartedResolve = resolve;
+      });
+      strategy.onFill.mockImplementation(async () => {
+        fillStartedResolve();
+        await fillStarted;
+      });
+
+      await session.start({candleSource: 'external'});
+      const first = await session.next(sampleCandle);
+      expect(first?.execution.status).toBe('PLACED');
+
+      exchange.emit('order-topic-1', {...sampleFill, order_id: 'order-2'});
+      await fillStartedSignal;
+      const secondNext = session.next({...sampleCandle, openTimeInISO: '2024-01-01T00:01:00.000Z'});
+      await Promise.resolve();
+      expect(strategy.onCandle).toHaveBeenCalledOnce();
+
+      releaseFill();
+      await secondNext;
+      expect(strategy.onCandle).toHaveBeenCalledTimes(2);
+      await session.stop();
     });
 
     it('rejects external candle input before the session is ready', async () => {

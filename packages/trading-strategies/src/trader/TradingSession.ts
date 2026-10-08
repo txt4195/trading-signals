@@ -2,6 +2,7 @@ import {EventEmitter} from 'node:events';
 import {CandleBatcher, ONE_MINUTE_IN_MS} from '@typedtrader/exchange';
 import type {BatchedCandle, Candle, Fill, PendingOrder} from '@typedtrader/exchange';
 import {AdviceExecutor} from './AdviceExecutor.js';
+import type {AdviceExecution} from './AdviceExecutor.js';
 import type {
   OrderAdvice,
   TradingSessionEventMap,
@@ -22,6 +23,7 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
   #candleTopicId: string | null = null;
   #orderTopicId: string | null = null;
   #running = false;
+  #fillProcessing: Promise<void> = Promise.resolve();
 
   constructor(options: TradingSessionOptions) {
     super();
@@ -38,7 +40,8 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
   /** New strategy input uses the same advice executor and order state as candles. */
   async onSignal(context: TradingSessionSignalContext): Promise<void> {
     if (!this.#running || !this.#state) throw new Error('TradingSession is not running');
-    if (!Number.isSafeInteger(context.at_ms) || context.at_ms < 0) throw new Error('TradingSession signal clock is invalid');
+    if (!Number.isSafeInteger(context.at_ms) || context.at_ms < 0)
+      throw new Error('TradingSession signal clock is invalid');
     if (!this.#strategy.onSignal) throw new Error('TradingSession strategy does not consume signals');
     try {
       const balances = await this.#broker.getAvailableBalances(this.#pair);
@@ -91,6 +94,7 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
 
     // The broker owns fills in either mode; only candle ownership changes for an external feeder.
     if ((options.candleSource ?? 'broker') === 'broker') {
+      if (!this.#broker.watchCandles) throw new Error('Broker does not provide candle subscriptions');
       const openTimeInISO = new Date().toISOString();
       this.#candleTopicId = await this.#broker.watchCandles(this.#pair, ONE_MINUTE_IN_MS, openTimeInISO);
       this.#broker.on(this.#candleTopicId, this.#onCandle);
@@ -106,7 +110,7 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
     }
 
     if (this.#candleTopicId) {
-      this.#broker.unwatchCandles(this.#candleTopicId);
+      this.#broker.unwatchCandles?.(this.#candleTopicId);
       this.#candleTopicId = null;
     }
 
@@ -126,8 +130,12 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
   }
 
   /** Process one externally supplied candle and await its strategy advice/order submission. */
-  async next(candle: Candle | BatchedCandle): Promise<void> {
+  async next(candle: Candle | BatchedCandle): Promise<{advice: OrderAdvice; execution: AdviceExecution} | undefined> {
     if (!this.#running || !this.#state) throw new Error('TradingSession is not running');
+    // A broker may synchronously publish fills while its candle is being advanced. Await
+    // only the fill work already announced at this input boundary, never a future fill.
+    const fillsAtInput = this.#fillProcessing;
+    await fillsAtInput;
     try {
       const batchedCandle = CandleBatcher.isBatchedCandle(candle) ? candle : CandleBatcher.toBatchedCandle(candle);
       if (!CandleBatcher.isOneMinuteCandle(batchedCandle)) {
@@ -141,16 +149,25 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
       const advice = await this.#strategy.onCandle(batchedCandle, this.#state!);
       if (advice) {
         this.emit('advice', advice);
-        await this.#executeAdvice(advice);
+        const execution = await this.#executeAdvice(advice);
+        return {advice, execution};
       }
+      return undefined;
     } catch (error) {
       this.emit('error', error instanceof Error ? error : new Error(String(error)));
+      return undefined;
     }
   }
 
-  readonly #onCandle = async (candle: Candle | BatchedCandle): Promise<void> => this.next(candle);
+  readonly #onCandle = async (candle: Candle | BatchedCandle): Promise<void> => {
+    await this.next(candle);
+  };
 
-  readonly #onFill = async (fill: Fill): Promise<void> => {
+  readonly #onFill = (fill: Fill): void => {
+    this.#fillProcessing = this.#fillProcessing.then(() => this.#handleFill(fill));
+  };
+
+  async #handleFill(fill: Fill): Promise<void> {
     try {
       const pending = this.#pendingOrders.get(fill.order_id);
       if (!this.#state || !pending) {
@@ -179,9 +196,9 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
     } catch (error) {
       this.emit('error', error instanceof Error ? error : new Error(String(error)));
     }
-  };
+  }
 
-  async #executeAdvice(advice: OrderAdvice): Promise<void> {
+  async #executeAdvice(advice: OrderAdvice): Promise<AdviceExecution> {
     if (this.#pendingOrders.size > 0) {
       /*
        * Only forget orders that were actually canceled. Any pending order missing
@@ -204,10 +221,11 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
 
     if (outcome.status === 'SKIPPED') {
       this.emit('error', outcome.error);
-      return;
+      return outcome;
     }
 
     this.#pendingOrders.set(outcome.order.id, outcome.order);
     this.emit('order', outcome.order);
+    return outcome;
   }
 }
