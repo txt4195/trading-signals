@@ -22,6 +22,8 @@ import type {
 export interface TradingSessionStrategy {
   init?(market: Pick<MarketDataSource, 'getRecentCandles'>, pair: TradingPair): Promise<void>;
   onCandle(candle: OneMinuteBatchedCandle, state: TradingSessionState): Promise<OrderAdvice | void>;
+  /** Evaluate newly available strategy input without replaying a source candle. */
+  onSignal?(context: TradingSessionSignalContext, state: TradingSessionState): Promise<OrderAdvice | void>;
   onFill?(fill: Fill, state: TradingSessionState): Promise<void>;
   /**
    * Called after `onFill` once the session determines that one of the strategy's
@@ -37,6 +39,11 @@ export interface TradingSessionStrategy {
    * are responsible for not being chatty — every call reaches the user.
    */
   onMessage?: (text: string) => void;
+}
+
+/** Actual knowledge/receipt clock. Price and fills remain owned by the broker. */
+export interface TradingSessionSignalContext {
+  at_ms: number;
 }
 
 /** Use as `amount` in an `OrderAdvice` to use the full available balance. */

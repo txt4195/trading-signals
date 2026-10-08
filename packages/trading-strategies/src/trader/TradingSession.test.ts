@@ -87,6 +87,42 @@ describe('TradingSession', {concurrent: false}, () => {
   let strategy: ReturnType<typeof createMockStrategy>;
   let session: TradingSession;
 
+  it('evaluates signal input through the same advice executor without replaying candles', async () => {
+    const broker = createMockExchange();
+    const owner = createMockStrategy();
+    const onSignal = vi.fn<NonNullable<TradingSessionStrategy['onSignal']>>().mockResolvedValue({type: 'MARKET', side: 'BUY', amountIn: 'base', amount: '1'});
+    const trading = new TradingSession({broker, pair, strategy: {...owner, onSignal}});
+    const orders = vi.fn();
+    const candles = vi.fn();
+    trading.on('order', orders);
+    trading.on('candle', candles);
+    await trading.start();
+    await trading.onSignal({at_ms: 60_001});
+    expect(onSignal).toHaveBeenCalledWith({at_ms: 60_001}, expect.objectContaining({baseBalance: new Big('10')}));
+    expect(owner.onCandle).not.toHaveBeenCalled();
+    expect(candles).not.toHaveBeenCalled();
+    expect(broker.placeMarketOrder).toHaveBeenCalledWith(pair, {side: 'BUY', size: '1', sizeInCounter: false});
+    expect(orders).toHaveBeenCalledOnce();
+    await trading.stop();
+    await expect(trading.onSignal({at_ms: 60_002})).rejects.toThrow('not running');
+  });
+
+  it('reports signal evaluation errors without starting a separate order path', async () => {
+    const broker = createMockExchange();
+    const owner = createMockStrategy();
+    const onSignal = vi.fn<NonNullable<TradingSessionStrategy['onSignal']>>().mockRejectedValue(new Error('position_unavailable'));
+    const trading = new TradingSession({broker, pair, strategy: {...owner, onSignal}});
+    const errors = vi.fn();
+    trading.on('error', errors);
+    await trading.start();
+    await trading.onSignal({at_ms: 60_001});
+    expect(errors).toHaveBeenCalledWith(expect.objectContaining({message: 'position_unavailable'}));
+    expect(broker.placeMarketOrder).not.toHaveBeenCalled();
+    expect(broker.placeLimitOrder).not.toHaveBeenCalled();
+    expect(owner.onCandle).not.toHaveBeenCalled();
+    await trading.stop();
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     exchange = createMockExchange();

@@ -6,6 +6,7 @@ import type {
   OrderAdvice,
   TradingSessionEventMap,
   TradingSessionOptions,
+  TradingSessionSignalContext,
   TradingSessionState,
 } from './TradingSessionTypes.js';
 
@@ -31,6 +32,24 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
 
   get running() {
     return this.#running;
+  }
+
+  /** New strategy input uses the same advice executor and order state as candles. */
+  async onSignal(context: TradingSessionSignalContext): Promise<void> {
+    if (!this.#running || !this.#state) throw new Error('TradingSession is not running');
+    if (!Number.isSafeInteger(context.at_ms) || context.at_ms < 0) throw new Error('TradingSession signal clock is invalid');
+    if (!this.#strategy.onSignal) throw new Error('TradingSession strategy does not consume signals');
+    try {
+      const balances = await this.#broker.getAvailableBalances(this.#pair);
+      this.#state = {...this.#state, baseBalance: balances.base, counterBalance: balances.counter};
+      const advice = await this.#strategy.onSignal(context, this.#state);
+      if (advice) {
+        this.emit('advice', advice);
+        await this.#executeAdvice(advice);
+      }
+    } catch (error) {
+      this.emit('error', error instanceof Error ? error : new Error(String(error)));
+    }
   }
 
   async start(): Promise<void> {
