@@ -210,6 +210,31 @@ describe('TradingSession', {concurrent: false}, () => {
   });
 
   describe('candle handling', () => {
+    it('processes an externally supplied candle once and awaits its advice without subscribing to candles', async () => {
+      strategy.onCandle.mockResolvedValue({
+        type: 'MARKET', side: OrderSide.BUY, amountIn: 'counter', amount: AllAvailableAmount,
+      });
+      const orders = vi.fn();
+      session.on('order', orders);
+
+      await session.start({candleSource: 'external'});
+      expect(exchange.watchOrders).toHaveBeenCalledOnce();
+      expect(exchange.watchCandles).not.toHaveBeenCalled();
+
+      await session.next(sampleCandle);
+
+      expect(strategy.onCandle).toHaveBeenCalledOnce();
+      expect(exchange.placeMarketOrder).toHaveBeenCalledOnce();
+      expect(orders).toHaveBeenCalledOnce();
+      await session.stop();
+      expect(exchange.unwatchCandles).not.toHaveBeenCalled();
+      expect(exchange.unwatchOrders).toHaveBeenCalledOnce();
+    });
+
+    it('rejects external candle input before the session is ready', async () => {
+      await expect(session.next(sampleCandle)).rejects.toThrow('TradingSession is not running');
+    });
+
     it('forwards candles to strategy', async () => {
       await session.start();
 

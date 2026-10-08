@@ -121,6 +121,12 @@ export interface TradingSessionOptions {
   strategy: TradingSessionStrategy;
 }
 
+/** Select the candle producer while keeping order/fill handling owned by the broker session. */
+export interface TradingSessionStartOptions {
+  /** Defaults to the broker's candle stream. Use `external` when a caller supplies candles through `next`. */
+  candleSource?: 'broker' | 'external';
+}
+
 export type TradingSessionEventMap = {
   advice: [OrderAdvice];
   candle: [BatchedCandle];

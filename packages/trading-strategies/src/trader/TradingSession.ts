@@ -6,6 +6,7 @@ import type {
   OrderAdvice,
   TradingSessionEventMap,
   TradingSessionOptions,
+  TradingSessionStartOptions,
   TradingSessionSignalContext,
   TradingSessionState,
 } from './TradingSessionTypes.js';
@@ -52,7 +53,7 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
     }
   }
 
-  async start(): Promise<void> {
+  async start(options: TradingSessionStartOptions = {}): Promise<void> {
     if (this.#running) {
       throw new Error('TradingSession is already running');
     }
@@ -88,10 +89,12 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
 
     await this.#strategy.init?.(this.#broker, this.#pair);
 
-    // Subscribe to candles only after state is ready
-    const openTimeInISO = new Date().toISOString();
-    this.#candleTopicId = await this.#broker.watchCandles(this.#pair, ONE_MINUTE_IN_MS, openTimeInISO);
-    this.#broker.on(this.#candleTopicId, this.#onCandle);
+    // The broker owns fills in either mode; only candle ownership changes for an external feeder.
+    if ((options.candleSource ?? 'broker') === 'broker') {
+      const openTimeInISO = new Date().toISOString();
+      this.#candleTopicId = await this.#broker.watchCandles(this.#pair, ONE_MINUTE_IN_MS, openTimeInISO);
+      this.#broker.on(this.#candleTopicId, this.#onCandle);
+    }
 
     this.#running = true;
     this.emit('started');
@@ -122,7 +125,9 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
     this.emit('stopped');
   }
 
-  readonly #onCandle = async (candle: Candle | BatchedCandle): Promise<void> => {
+  /** Process one externally supplied candle and await its strategy advice/order submission. */
+  async next(candle: Candle | BatchedCandle): Promise<void> {
+    if (!this.#running || !this.#state) throw new Error('TradingSession is not running');
     try {
       const batchedCandle = CandleBatcher.isBatchedCandle(candle) ? candle : CandleBatcher.toBatchedCandle(candle);
       if (!CandleBatcher.isOneMinuteCandle(batchedCandle)) {
@@ -141,7 +146,9 @@ export class TradingSession extends EventEmitter<TradingSessionEventMap> {
     } catch (error) {
       this.emit('error', error instanceof Error ? error : new Error(String(error)));
     }
-  };
+  }
+
+  readonly #onCandle = async (candle: Candle | BatchedCandle): Promise<void> => this.next(candle);
 
   readonly #onFill = async (fill: Fill): Promise<void> => {
     try {
